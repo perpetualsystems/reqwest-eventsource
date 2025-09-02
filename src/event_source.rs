@@ -183,7 +183,7 @@ impl<'a> EventSourceProjection<'a> {
 
     fn handle_error(&mut self, error: &Error) {
         self.clear_fetch();
-        if self.is_closed {
+        if *self.is_closed {
             //Stop reconnecting if we have closed connection.
             *self.is_closed = true;
             return;
