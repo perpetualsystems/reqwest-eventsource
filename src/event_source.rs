@@ -183,6 +183,12 @@ impl<'a> EventSourceProjection<'a> {
 
     fn handle_error(&mut self, error: &Error) {
         self.clear_fetch();
+        if self.is_closed {
+            //Stop reconnecting if we have closed connection.
+            *self.is_closed = true;
+            return;
+        }
+
         if let Some(retry_delay) = self.retry_policy.retry(error, *self.last_retry) {
             let retry_num = self.last_retry.map(|retry| retry.0).unwrap_or(1);
             *self.last_retry = Some((retry_num, retry_delay));
@@ -215,44 +221,47 @@ impl Stream for EventSource {
         let mut this = self.project();
 
         if *this.is_closed {
-            return Poll::Ready(None);
-        }
-
-        if let Some(delay) = this.delay.as_mut().as_pin_mut() {
-            match delay.poll(cx) {
-                Poll::Ready(_) => {
-                    this.delay.take();
-                    if let Err(err) = this.retry_fetch() {
-                        *this.is_closed = true;
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                }
-                Poll::Pending => return Poll::Pending,
+            if this.cur_stream.is_none() {
+                return Poll::Ready(None);
             }
-        }
-
-        if let Some(response_future) = this.next_response.as_mut().as_pin_mut() {
-            match response_future.poll(cx) {
-                Poll::Ready(Ok(res)) => {
-                    this.clear_fetch();
-                    match check_response(res) {
-                        Ok(res) => {
-                            this.handle_response(res);
-                            return Poll::Ready(Some(Ok(Event::Open)));
-                        }
-                        Err(err) => {
+        } else {
+            // Only re-establish a connection if we have not been told to shutdown
+            if let Some(delay) = this.delay.as_mut().as_pin_mut() {
+                match delay.poll(cx) {
+                    Poll::Ready(_) => {
+                        this.delay.take();
+                        if let Err(err) = this.retry_fetch() {
                             *this.is_closed = true;
                             return Poll::Ready(Some(Err(err)));
                         }
                     }
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Ready(Err(err)) => {
-                    let err = Error::Transport(err);
-                    this.handle_error(&err);
-                    return Poll::Ready(Some(Err(err)));
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
+            }
+
+            if let Some(response_future) = this.next_response.as_mut().as_pin_mut() {
+                match response_future.poll(cx) {
+                    Poll::Ready(Ok(res)) => {
+                        this.clear_fetch();
+                        match check_response(res) {
+                            Ok(res) => {
+                                this.handle_response(res);
+                                return Poll::Ready(Some(Ok(Event::Open)));
+                            }
+                            Err(err) => {
+                                *this.is_closed = true;
+                                return Poll::Ready(Some(Err(err)));
+                            }
+                        }
+                    }
+                    Poll::Ready(Err(err)) => {
+                        let err = Error::Transport(err);
+                        this.handle_error(&err);
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
                 }
             }
         }
